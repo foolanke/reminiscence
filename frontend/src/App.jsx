@@ -8,6 +8,49 @@ function apiUrl(path) {
   return `${apiBaseUrl}${path}`;
 }
 
+async function readJson(response, fallbackMessage) {
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || fallbackMessage);
+  return body;
+}
+
+async function fetchJson(path, options, fallbackMessage) {
+  return readJson(await fetch(apiUrl(path), options), fallbackMessage);
+}
+
+function clampProgress(value) {
+  return Math.min(Math.max(Number(value) || 0, 0), 1);
+}
+
+function PipelineProgress({ job, uploading }) {
+  if (!job && !uploading) return null;
+
+  const value = uploading
+    ? 0.04
+    : clampProgress(job.progress ?? (job.status === "complete" || job.status === "failed" ? 1 : 0.12));
+  const label = uploading
+    ? "Uploading video"
+    : job.stage_label || (job.status === "complete" ? "Complete" : "Processing");
+
+  return (
+    <div className={`pipeline-progress ${job?.status || (uploading ? "uploading" : "")}`}>
+      <div className="progress-copy">
+        <span>{label}</span>
+        <span>{Math.round(value * 100)}%</span>
+      </div>
+      <div
+        className="progress-track"
+        role="progressbar"
+        aria-label="Processing progress"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={Math.round(value * 100)}
+      >
+        <span style={{ width: `${value * 100}%` }} />
+      </div>
+    </div>
+  );
+}
 function MomentComparison({ previewSrc, sourceSrc }) {
   const [previewAvailable, setPreviewAvailable] = useState(Boolean(previewSrc));
   const [sourceAvailable, setSourceAvailable] = useState(Boolean(sourceSrc));
@@ -64,10 +107,11 @@ export default function App() {
 
     async function poll() {
       try {
-        const response = await fetch(apiUrl(`/api/v1/moments/${job.id}`));
-        const body = await response.json();
-        if (!response.ok) throw new Error(body.detail || "Could not read job status");
-        if (!cancelled) setJob(body);
+        const body = await fetchJson(`/api/v1/moments/${job.id}`, undefined, "Could not read job status");
+        if (!cancelled) {
+          setJob(body);
+          setError("");
+        }
       } catch (pollError) {
         if (!cancelled) setError(pollError.message);
       }
@@ -97,12 +141,7 @@ export default function App() {
     form.append("duration", "0");
 
     try {
-      const response = await fetch(apiUrl("/api/v1/moments"), {
-        method: "POST",
-        body: form,
-      });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.detail || "Upload failed");
+      const body = await fetchJson("/api/v1/moments", { method: "POST", body: form }, "Upload failed");
       setJob(body);
       window.history.replaceState(null, "", `?job=${encodeURIComponent(body.id)}`);
     } catch (uploadError) {
@@ -117,8 +156,7 @@ export default function App() {
     try {
       const response = await fetch(apiUrl(`/api/v1/moments/${job.id}/splat`));
       if (!response.ok) {
-        const body = await response.json();
-        throw new Error(body.detail || "Download failed");
+        await readJson(response, "Download failed");
       }
       const url = URL.createObjectURL(await response.blob());
       const anchor = document.createElement("a");
@@ -163,6 +201,8 @@ export default function App() {
           </button>
         </form>
 
+        <PipelineProgress uploading={uploading && !job} />
+
         {job && (
           <div className="job">
             <div>
@@ -170,8 +210,12 @@ export default function App() {
               <h2>{job.status}</h2>
             </div>
             <span className={`status ${job.status}`} />
+            <PipelineProgress job={job} uploading={false} />
             {job.registered_image_count != null && (
               <p>{job.registered_image_count} camera views registered</p>
+            )}
+            {job.splat_count != null && (
+              <p>{Number(job.splat_count).toLocaleString()} Gaussian splats generated</p>
             )}
             {job.error && <p className="error">{job.error}</p>}
             {job.status === "complete" && (

@@ -6,11 +6,33 @@ import shutil
 import shlex
 import subprocess
 import struct
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_FASTGS_ITERATIONS = 5000
+DEFAULT_FASTGS_ITERATIONS = 30000
+ProgressCallback = Callable[[str, int, int], None]
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+PROGRESS_FRACTION_RE = re.compile(r"(?P<current>\d+)\s*/\s*(?P<total>\d+)")
+FASTGS_STATIC_TRAIN_ARGS = [
+	"--eval",
+	"--densification_interval",
+	"100",
+	"--optimizer_type",
+	"default",
+	"--loss_thresh",
+	"0.06",
+	"--highfeature_lr",
+	"0.0015",
+	"--dense",
+	"0.003",
+	"--mult",
+	"0.7",
+	"--grad_abs_thresh",
+	"0.0005",
+]
 
 
 @dataclass(frozen=True)
@@ -52,6 +74,63 @@ def _read_colmap_registered_image_count(images_bin_path: Path) -> int:
 	return struct.unpack("<Q", data)[0]
 
 
+def run_colmap_reconstruction(video_path: Path, output_dir: Path, script_path: Path, fps: int = 5) -> None:
+	env = os.environ.copy()
+	env["COLMAP_USE_GPU"] = "0"
+	env["QT_QPA_PLATFORM"] = "offscreen"
+	subprocess.run(
+		[
+			sys.executable,
+			str(script_path),
+			str(video_path),
+			str(output_dir),
+			"--fps",
+			str(fps),
+			"--overwrite",
+			"--export-ply",
+		],
+		check=True,
+		env=env,
+	)
+
+
+def _first_existing_file(paths: tuple[Path, ...], message: str) -> Path:
+	for path in paths:
+		if path.is_file():
+			return path
+	raise FileNotFoundError(message)
+
+
+def _copy_colmap_scene(colmap_output_dir: Path, dataset_dir: Path) -> int:
+	images_src = colmap_output_dir / "images"
+	cameras_src = colmap_output_dir / "sparse" / "0" / "cameras.bin"
+	images_bin_src = colmap_output_dir / "sparse" / "0" / "images.bin"
+	points3d_bin_src = colmap_output_dir / "sparse" / "0" / "points3D.bin"
+	points3d_ply_src = _first_existing_file(
+		(colmap_output_dir / "sparse_points.ply", colmap_output_dir / "points3d.ply"),
+		"Missing sparse PLY output. Expected sparse_points.ply or points3d.ply.",
+	)
+
+	if not images_src.is_dir():
+		raise FileNotFoundError(f"Required image directory is missing: {images_src}")
+	for path in (cameras_src, images_bin_src, points3d_bin_src):
+		_require_file(path)
+
+	sparse0_dir = dataset_dir / "sparse" / "0"
+	sparse0_dir.mkdir(parents=True, exist_ok=False)
+	shutil.copytree(images_src, dataset_dir / "images", dirs_exist_ok=True)
+	for source, names in (
+		(cameras_src, ("cameras.bin",)),
+		(images_bin_src, ("images.bin",)),
+		(points3d_bin_src, ("points3D.bin", "points3d.bin")),
+		(points3d_ply_src, ("points3D.ply", "points3d.ply")),
+	):
+		for name in names:
+			shutil.copy2(source, sparse0_dir / name)
+
+	return _read_colmap_registered_image_count(images_bin_src)
+
+
 def _windows_to_wsl_path(path: Path) -> str:
 	path = path.resolve()
 
@@ -63,15 +142,48 @@ def _windows_to_wsl_path(path: Path) -> str:
 	return path.as_posix()
 
 
+def _fastgs_paths(dataset_name: str) -> tuple[str, str]:
+	return f"./datasets/input/{dataset_name}", f"./output/{dataset_name}"
+
+
+def _fastgs_train_args(training_iterations: int) -> list[str]:
+	iterations = str(training_iterations)
+	return [
+		"--iterations",
+		iterations,
+		*FASTGS_STATIC_TRAIN_ARGS,
+		"--test_iterations",
+		iterations,
+		"--save_iterations",
+		iterations,
+		"--checkpoint_iterations",
+		iterations,
+		"--densify_until_iter",
+		iterations,
+	]
+
+
+def _fastgs_native_commands(
+	python: str,
+	dataset_name: str,
+	training_iterations: int,
+) -> tuple[list[str], list[str]]:
+	dataset_rel, model_rel = _fastgs_paths(dataset_name)
+	common = ["-s", dataset_rel, "-m", model_rel]
+	return (
+		[python, "train.py", *common, *_fastgs_train_args(training_iterations)],
+		[python, "render.py", *common, "--skip_test"],
+	)
+
+
 def _build_wsl_training_command(
 	fastgs_root: Path,
 	dataset_name: str,
 	training_iterations: int = DEFAULT_FASTGS_ITERATIONS,
 ) -> str:
 	fastgs_wsl = shlex.quote(_windows_to_wsl_path(fastgs_root))
-	dataset_rel = shlex.quote(f"./datasets/input/{dataset_name}")
-	model_rel = shlex.quote(f"./output/{dataset_name}")
-	iterations = shlex.quote(str(training_iterations))
+	dataset_rel, model_rel = (shlex.quote(value) for value in _fastgs_paths(dataset_name))
+	train_args = " ".join(shlex.quote(arg) for arg in _fastgs_train_args(training_iterations))
 
 	return (
 		"set -e; "
@@ -85,62 +197,104 @@ def _build_wsl_training_command(
 		'test -n "\\$FASTGS_PYTHON"; '
 		'"\\$FASTGS_PYTHON" -c "import torch, torchvision, plyfile, tqdm"; '
 		"CUDA_VISIBLE_DEVICES=0 "
+		"PYTHONUNBUFFERED=1 "
 		f"OAR_JOB_ID={dataset_name} "
 		'"\\$FASTGS_PYTHON" train.py '
 		f"-s {dataset_rel} "
 		f"-m {model_rel} "
-		f"--iterations {iterations} "
-		"--eval --densification_interval 500 --optimizer_type default "
-		f"--test_iterations {iterations} "
-		f"--save_iterations {iterations} "
-		f"--checkpoint_iterations {iterations} "
-		"--highfeature_lr 0.0015 --dense 0.003 --mult 0.7; "
+		f"{train_args}; "
 		"CUDA_VISIBLE_DEVICES=0 "
+		"PYTHONUNBUFFERED=1 "
 		'"\\$FASTGS_PYTHON" render.py '
-		f"-s {dataset_rel} -m {model_rel} --skip_train"
+		f"-s {dataset_rel} -m {model_rel} --skip_test"
 	)
+
+
+def _handle_process_output(
+	fragment: str,
+	progress_callback: ProgressCallback | None,
+	logged_progress: dict[str, int],
+) -> None:
+	clean = ANSI_ESCAPE_RE.sub("", fragment).strip()
+	if not clean:
+		return
+
+	stage = ""
+	label = ""
+	if "Training progress" in clean:
+		stage = "training"
+		label = "Training progress"
+	elif "Rendering progress" in clean:
+		stage = "rendering"
+		label = "Rendering progress"
+
+	if stage:
+		match = PROGRESS_FRACTION_RE.search(clean)
+		if match:
+			current = int(match.group("current"))
+			total = int(match.group("total"))
+			if total > 0:
+				if progress_callback:
+					progress_callback(stage, current, total)
+				percent = int(current * 100 / total)
+				should_log = current == total or percent >= logged_progress.get(stage, -5) + 5
+				if should_log:
+					logged_progress[stage] = percent
+					print(f"{label}: {percent}% ({current}/{total})", flush=True)
+			return
+
+	print(clean, flush=True)
+
+
+def _run_streamed_subprocess(
+	command: list[str],
+	cwd: Path,
+	env: dict[str, str] | None = None,
+	progress_callback: ProgressCallback | None = None,
+) -> None:
+	with subprocess.Popen(
+		command,
+		cwd=cwd,
+		env=env,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.STDOUT,
+		text=True,
+		bufsize=0,
+	) as process:
+		assert process.stdout is not None
+		fragment = ""
+		logged_progress: dict[str, int] = {}
+
+		for char in iter(lambda: process.stdout.read(1), ""):
+			if char in "\r\n":
+				_handle_process_output(fragment, progress_callback, logged_progress)
+				fragment = ""
+			else:
+				fragment += char
+
+		if fragment:
+			_handle_process_output(fragment, progress_callback, logged_progress)
+
+		returncode = process.wait()
+	if returncode:
+		raise subprocess.CalledProcessError(returncode, command)
 
 
 def _run_native_training(
 	fastgs_root: Path,
 	dataset_name: str,
 	training_iterations: int,
+	progress_callback: ProgressCallback | None = None,
 ) -> str:
 	python = os.environ.get("FASTGS_PYTHON", "python")
-	dataset_rel = f"./datasets/input/{dataset_name}"
-	model_rel = f"./output/{dataset_name}"
-	common = ["-s", dataset_rel, "-m", model_rel]
-	train_command = [
-		python,
-		"train.py",
-		*common,
-		"--iterations",
-		str(training_iterations),
-		"--eval",
-		"--densification_interval",
-		"500",
-		"--optimizer_type",
-		"default",
-		"--test_iterations",
-		str(training_iterations),
-		"--save_iterations",
-		str(training_iterations),
-		"--checkpoint_iterations",
-		str(training_iterations),
-		"--highfeature_lr",
-		"0.0015",
-		"--dense",
-		"0.003",
-		"--mult",
-		"0.7",
-	]
-	render_command = [python, "render.py", *common, "--skip_train"]
+	train_command, render_command = _fastgs_native_commands(python, dataset_name, training_iterations)
 	env = os.environ.copy()
 	env["CUDA_VISIBLE_DEVICES"] = env.get("CUDA_VISIBLE_DEVICES", "0")
 	env["OAR_JOB_ID"] = dataset_name
+	env["PYTHONUNBUFFERED"] = "1"
 
-	subprocess.run(train_command, cwd=fastgs_root, env=env, check=True)
-	subprocess.run(render_command, cwd=fastgs_root, env=env, check=True)
+	_run_streamed_subprocess(train_command, cwd=fastgs_root, env=env, progress_callback=progress_callback)
+	_run_streamed_subprocess(render_command, cwd=fastgs_root, env=env, progress_callback=progress_callback)
 	return shlex.join(train_command) + " && " + shlex.join(render_command)
 
 
@@ -149,6 +303,7 @@ def prepare_fastgs_input_and_train(
 	fastgs_root: Path,
 	run_training: bool = True,
 	training_iterations: int = DEFAULT_FASTGS_ITERATIONS,
+	progress_callback: ProgressCallback | None = None,
 ) -> PipelineResult:
 	colmap_output_dir = colmap_output_dir.resolve()
 	fastgs_root = fastgs_root.resolve()
@@ -160,47 +315,8 @@ def prepare_fastgs_input_and_train(
 	dataset_name = f"input_{input_idx}"
 
 	dataset_dir = dataset_root / dataset_name
-	images_dir = dataset_dir / "images"
-	sparse0_dir = dataset_dir / "sparse" / "0"
-
-	images_src = colmap_output_dir / "images"
-	cameras_src = colmap_output_dir / "sparse" / "0" / "cameras.bin"
-	images_bin_src = colmap_output_dir / "sparse" / "0" / "images.bin"
-	points3d_bin_src = colmap_output_dir / "sparse" / "0" / "points3D.bin"
-	points3d_ply_src = colmap_output_dir / "sparse_points.ply"
-
-	if not images_src.exists() or not images_src.is_dir():
-		raise FileNotFoundError(f"Required image directory is missing: {images_src}")
-
-	_require_file(cameras_src)
-	_require_file(images_bin_src)
-	_require_file(points3d_bin_src)
-	registered_image_count = _read_colmap_registered_image_count(images_bin_src)
-
-	if not points3d_ply_src.exists():
-		alternate_ply = colmap_output_dir / "points3d.ply"
-		if alternate_ply.exists():
-			points3d_ply_src = alternate_ply
-		else:
-			raise FileNotFoundError(
-				"Missing sparse PLY output. Expected one of: "
-				f"{colmap_output_dir / 'sparse_points.ply'} or {alternate_ply}"
-			)
-
-	images_dir.mkdir(parents=True, exist_ok=False)
-	sparse0_dir.mkdir(parents=True, exist_ok=False)
-
-	shutil.copytree(images_src, images_dir, dirs_exist_ok=True)
-	shutil.copy2(cameras_src, sparse0_dir / "cameras.bin")
-	shutil.copy2(images_bin_src, sparse0_dir / "images.bin")
-	# FastGS expects COLMAP's points3D casing; keep lowercase aliases for downstream compatibility.
-	shutil.copy2(points3d_bin_src, sparse0_dir / "points3D.bin")
-	shutil.copy2(points3d_bin_src, sparse0_dir / "points3d.bin")
-	shutil.copy2(points3d_ply_src, sparse0_dir / "points3D.ply")
-	shutil.copy2(points3d_ply_src, sparse0_dir / "points3d.ply")
-
-	if colmap_output_dir.exists():
-		shutil.rmtree(colmap_output_dir)
+	registered_image_count = _copy_colmap_scene(colmap_output_dir, dataset_dir)
+	shutil.rmtree(colmap_output_dir, ignore_errors=True)
 
 	if os.name == "nt" and os.environ.get("FASTGS_NATIVE", "").lower() not in {"1", "true", "yes"}:
 		wsl_command = _build_wsl_training_command(
@@ -209,7 +325,11 @@ def prepare_fastgs_input_and_train(
 			training_iterations=training_iterations,
 		)
 		if run_training:
-			subprocess.run(["wsl", "bash", "-lc", wsl_command], check=True)
+			_run_streamed_subprocess(
+				["wsl", "bash", "-lc", wsl_command],
+				cwd=fastgs_root,
+				progress_callback=progress_callback,
+			)
 	else:
 		wsl_command = "native FastGS execution"
 		if run_training:
@@ -217,13 +337,14 @@ def prepare_fastgs_input_and_train(
 				fastgs_root=fastgs_root,
 				dataset_name=dataset_name,
 				training_iterations=training_iterations,
+				progress_callback=progress_callback,
 			)
 
 	return PipelineResult(
 		dataset_name=dataset_name,
 		dataset_path=str(dataset_dir),
 		model_path=str(fastgs_root / "output" / dataset_name),
-		render_path=str(fastgs_root / "output" / dataset_name / "test" / f"ours_{training_iterations}" / "renders"),
+		render_path=str(fastgs_root / "output" / dataset_name / "train" / f"ours_{training_iterations}" / "renders"),
 		wsl_command=wsl_command,
 		registered_image_count=registered_image_count,
 	)
