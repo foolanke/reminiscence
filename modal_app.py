@@ -17,7 +17,10 @@ DATA_ROOT = Path("/reminiscence-data")
 JOB_ROOT = DATA_ROOT / "jobs"
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 MONTHLY_JOB_LIMIT = 30
-TRAINING_ITERATIONS = 30000
+# FastGS begins an aggressive final-pruning phase after 15k iterations. Small
+# reconstructions can collapse to only a handful of Gaussians at 18k, which
+# makes the CUDA rasterizer return an invalid gradient shape.
+TRAINING_ITERATIONS = 15000
 JOB_TIMEOUT_SECONDS = 20 * 60
 RETENTION_DAYS = 7
 UPLOAD_CHUNK_BYTES = 1024 * 1024

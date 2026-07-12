@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_FASTGS_ITERATIONS = 30000
+DEFAULT_FASTGS_ITERATIONS = 15000
 ProgressCallback = Callable[[str, int, int], None]
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PROGRESS_FRACTION_RE = re.compile(r"(?P<current>\d+)\s*/\s*(?P<total>\d+)")
