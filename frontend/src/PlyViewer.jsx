@@ -605,13 +605,13 @@ function createRenderer(canvas, pointCloud, mode) {
   return { draw, dispose };
 }
 
-function ViewerPane({ label, canvasRef, status, error, bindPointerHandlers }) {
+function ViewerPane({ label, canvasRef, wrapRef, status, error, bindPointerHandlers }) {
   return (
     <article className="viewer-card">
       <div className="viewer-title">
         <p className="eyebrow">{label}</p>
       </div>
-      <div className="viewer-canvas-wrap" {...bindPointerHandlers()}>
+      <div ref={wrapRef} className="viewer-canvas-wrap" {...bindPointerHandlers()}>
         <canvas ref={canvasRef} aria-label={label} />
         {status !== "ready" && (
           <div className="viewer-overlay">
@@ -627,6 +627,9 @@ export default function PlyViewer({ src }) {
   const pointCanvasRef = useRef(null);
   const gaussianCanvasRef = useRef(null);
   const fullscreenCanvasRef = useRef(null);
+  const pointWrapRef = useRef(null);
+  const gaussianWrapRef = useRef(null);
+  const fullscreenWrapRef = useRef(null);
   const fullscreenShellRef = useRef(null);
   const renderersRef = useRef([]);
   const fullscreenRendererRef = useRef(null);
@@ -708,6 +711,22 @@ export default function PlyViewer({ src }) {
     renderersRef.current.forEach((renderer) => renderer.draw(view));
     fullscreenRendererRef.current?.draw(view);
   }, [view]);
+
+  useEffect(() => {
+    const targets = [pointWrapRef.current, gaussianWrapRef.current, fullscreenWrapRef.current].filter(Boolean);
+
+    function handleWheel(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      setView((current) => ({
+        ...current,
+        distance: clamp(current.distance * Math.exp(event.deltaY * 0.001), 0.5, 8),
+      }));
+    }
+
+    targets.forEach((target) => target.addEventListener("wheel", handleWheel, { passive: false }));
+    return () => targets.forEach((target) => target.removeEventListener("wheel", handleWheel));
+  }, [fullscreen]);
 
   useEffect(() => {
     if (!fullscreen || !pointCloud || !fullscreenCanvasRef.current) return undefined;
@@ -831,10 +850,6 @@ export default function PlyViewer({ src }) {
       onDoubleClick() {
         setView(createInitialView(pointCloud));
       },
-      onWheel(event) {
-        event.preventDefault();
-        setView((current) => ({ ...current, distance: clamp(current.distance * Math.exp(event.deltaY * 0.001), 0.5, 8) }));
-      },
     };
   }
 
@@ -855,6 +870,7 @@ export default function PlyViewer({ src }) {
         <ViewerPane
           label="GAUSSIAN SPLAT"
           canvasRef={gaussianCanvasRef}
+          wrapRef={gaussianWrapRef}
           status={status}
           error={error}
           bindPointerHandlers={bindPointerHandlers}
@@ -862,6 +878,7 @@ export default function PlyViewer({ src }) {
         <ViewerPane
           label="POINT CLOUD"
           canvasRef={pointCanvasRef}
+          wrapRef={pointWrapRef}
           status={status}
           error={error}
           bindPointerHandlers={bindPointerHandlers}
@@ -886,7 +903,7 @@ export default function PlyViewer({ src }) {
               Exit
             </button>
           </div>
-          <div className="fullscreen-canvas-wrap" {...bindPointerHandlers()}>
+          <div ref={fullscreenWrapRef} className="fullscreen-canvas-wrap" {...bindPointerHandlers()}>
             <canvas ref={fullscreenCanvasRef} aria-label="Fullscreen Gaussian splat viewer" />
           </div>
         </div>
